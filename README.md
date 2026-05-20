@@ -21,27 +21,31 @@ Spring Boot + RabbitMQ 기반 커머스 주문 시스템 토이프로젝트.
 
 ## 아키텍처 개요
 
-```
-┌──────────┐       ┌──────────────┐       ┌─────────────────────────────────┐
-│  Client  │──────▶│  REST API    │──────▶│         RabbitMQ Broker         │
-│ (Postman │  HTTP │ - Product    │ AMQP  │                                 │
-│  / curl) │       │ - Order      │       │  ┌───────────────────────────┐  │
-└──────────┘       └──────┬───────┘       │  │  order.exchange (Topic)   │  │
-                          │               │  │                           │  │
-                          │  DB 저장      │  │  "order.created"          │  │
-                          ▼               │  │     ├──▶ stock.queue      │  │
-                   ┌──────────────┐       │  │     │                     │  │
-                   │    MySQL     │       │  │  "order.#"                │  │
-                   │  - products  │       │  │     └──▶ notification     │  │
-                   │  - orders    │       │  │          .queue           │  │
-                   │  - order_item│       │  └───────────────────────────┘  │
-                   └──────────────┘       │                                 │
-                                          │  ┌───────────────────────────┐  │
-                                          │  │  order.dlq.exchange       │  │
-                                          │  │  (Direct)                 │  │
-                                          │  │     └──▶ order.dlq       │  │
-                                          │  └───────────────────────────┘  │
-                                          └─────────────────────────────────┘
+```mermaid
+flowchart LR
+    Client["Client\n(Postman / curl)"]
+    API["REST API\nProductController\nOrderController"]
+    DB[("MySQL\nproducts\norders\norder_item")]
+    RMQ["RabbitMQ Broker"]
+
+    subgraph Exchange
+        OE["order.exchange\n(Topic)"]
+        DE["order.dlq.exchange\n(Direct)"]
+    end
+
+    subgraph Queues
+        SQ["stock.queue"]
+        NQ["notification.queue"]
+        DQ["order.dlq"]
+    end
+
+    Client -- "HTTP" --> API
+    API -- "JPA" --> DB
+    API -- "AMQP" --> OE
+    OE -- "order.created" --> SQ
+    OE -- "order.#" --> NQ
+    SQ -. "fail" .-> DE
+    DE -- "dlq" --> DQ
 ```
 
 ---
@@ -50,72 +54,38 @@ Spring Boot + RabbitMQ 기반 커머스 주문 시스템 토이프로젝트.
 
 ### 성공 시나리오 (재고 충분)
 
-```
-  ① 주문 생성 API 호출
-  ┌─────────────────────┐
-  │  POST /api/orders   │
-  │  { ordererName,     │
-  │    items: [{...}] } │
-  └────────┬────────────┘
-           │
-           ▼
-  ┌─────────────────────┐
-  │   OrderService      │
-  │                     │
-  │  1. Order 저장      │
-  │     (status=PENDING)│
-  │  2. 이벤트 발행     │
-  └────────┬────────────┘
-           │
-           ▼  ② RabbitMQ로 메시지 전송
-  ┌─────────────────────────────────────────────┐
-  │          order.exchange (Topic)              │
-  │                                             │
-  │  routing key = "order.created"              │
-  │     ├── "order.created" 매칭 → stock.queue  │
-  │     └── "order.#" 매칭 → notification.queue │
-  └──────────┬─────────────────┬────────────────┘
-             │                 │
-             ▼                 ▼
-  ┌──────────────────┐  ┌──────────────────────┐
-  │  ③ StockConsumer │  │ ④ NotificationConsumer│
-  │                  │  │                      │
-  │  재고 차감       │  │  알림 로그 출력      │
-  │  주문 상태 변경  │  │  (이메일/SMS 시뮬)   │
-  │  → CONFIRMED     │  │                      │
-  └──────────────────┘  └──────────────────────┘
+```mermaid
+flowchart TD
+    A["POST /api/orders\n(Client)"] --> B["OrderService\n1. Order 저장 (PENDING)\n2. 이벤트 발행"]
+    B --> C["order.exchange\n(Topic Exchange)"]
+    C -- "routing key: order.created" --> D["stock.queue"]
+    C -- "routing key: order.#" --> E["notification.queue"]
+    D --> F["StockConsumer\n재고 차감\nOrder → CONFIRMED"]
+    E --> G["NotificationConsumer\n알림 로그 출력"]
+
+    style A fill:#4CAF50,color:#fff
+    style F fill:#2196F3,color:#fff
+    style G fill:#2196F3,color:#fff
 ```
 
 ### 실패 시나리오 (재고 부족)
 
-```
-  ① 주문 생성 (PENDING) → ② 이벤트 발행
-           │
-           ▼
-  ┌──────────────────┐     ┌──────────────────────┐
-  │  StockConsumer   │     │ NotificationConsumer  │
-  │                  │     │                      │
-  │  재고 차감 시도  │     │  알림 정상 발송      │
-  │  → 재고 부족!    │     │  (실패 여부 무관)    │
-  │  → 예외 발생     │     └──────────────────────┘
-  │  → 트랜잭션 롤백 │
-  └────────┬─────────┘
-           │  ③ 메시지 처리 실패
-           │     stock.queue의 DLQ 설정에 의해
-           │     메시지가 자동으로 DLQ로 이동
-           ▼
-  ┌───────────────────────────────────┐
-  │  order.dlq.exchange → order.dlq  │
-  └────────────────┬──────────────────┘
-                   │
-                   ▼
-  ┌──────────────────────┐
-  │  ④ DeadLetterConsumer│
-  │                      │
-  │  주문 상태 변경      │
-  │  → FAILED            │
-  │  (보상 트랜잭션)     │
-  └──────────────────────┘
+```mermaid
+flowchart TD
+    A["POST /api/orders\n(Client)"] --> B["OrderService\nOrder 저장 (PENDING)\n이벤트 발행"]
+    B --> C["order.exchange\n(Topic Exchange)"]
+    C -- "order.created" --> D["stock.queue"]
+    C -- "order.#" --> E["notification.queue"]
+    D --> F["StockConsumer\n재고 차감 시도"]
+    F -- "IllegalStateException!\n재고 부족 → 트랜잭션 롤백" --> G["메시지 처리 실패\nDLQ 설정에 의해 자동 이동"]
+    G --> H["order.dlq"]
+    H --> I["DeadLetterConsumer\nOrder → FAILED\n(보상 트랜잭션)"]
+    E --> J["NotificationConsumer\n알림 정상 발송"]
+
+    style A fill:#4CAF50,color:#fff
+    style F fill:#f44336,color:#fff
+    style I fill:#FF9800,color:#fff
+    style J fill:#2196F3,color:#fff
 ```
 
 ---
@@ -131,27 +101,20 @@ Spring Boot + RabbitMQ 기반 커머스 주문 시스템 토이프로젝트.
 
 ### Queue
 
-| Queue | Binding Key | DLQ 설정 | 구독 Consumer |
-|-------|-------------|----------|---------------|
+| Queue | Binding Key | DLQ 설정 | Consumer |
+|-------|-------------|----------|----------|
 | `stock.queue` | `order.created` | O (실패 시 `order.dlq`로 이동) | StockConsumer |
 | `notification.queue` | `order.#` | X | NotificationConsumer |
 | `order.dlq` | `dlq` | - | DeadLetterConsumer |
 
 ### Exchange 타입 비교
 
-```
- Topic Exchange                          Direct Exchange
- ───────────────                         ────────────────
- 패턴 매칭 라우팅                         정확한 키 매칭
+| 타입 | 라우팅 방식 | 예시 |
+|------|-------------|------|
+| **Topic** | 패턴 매칭 (`#`, `*`) | `order.#` → `order.created`, `order.canceled` 모두 매칭 |
+| **Direct** | 정확한 키 매칭 | `dlq` → `dlq`만 매칭 |
 
- "order.created" → stock.queue           "dlq" → order.dlq
- "order.#"       → notification.queue
- "order.canceled"→ notification.queue
-         ▲
-         │
-   # = 0개 이상의 단어 매칭
-   * = 정확히 1개 단어 매칭
-```
+> `#` = 0개 이상의 단어 매칭, `*` = 정확히 1개 단어 매칭
 
 ### 메시지 형식 (OrderCreatedEvent)
 
@@ -271,23 +234,13 @@ GET /api/orders
 
 ## 주문 상태 흐름
 
-```
-            주문 생성
-               │
-               ▼
-         ┌──────────┐
-         │ PENDING  │
-         └────┬─────┘
-              │
-     ┌────────┴────────┐
-     │                 │
-     ▼                 ▼
-┌──────────┐    ┌──────────┐
-│CONFIRMED │    │  FAILED  │
-│          │    │          │
-│ 재고 차감│    │ 재고 부족│
-│ 성공     │    │ 등 실패  │
-└──────────┘    └──────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING : 주문 생성
+    PENDING --> CONFIRMED : StockConsumer 재고 차감 성공
+    PENDING --> FAILED : DLQ를 통한 보상 처리
+    CONFIRMED --> [*]
+    FAILED --> [*]
 ```
 
 | 상태 | 설명 | 전이 조건 |
@@ -302,38 +255,38 @@ GET /api/orders
 
 ```
 src/main/java/toy/orderflow/
-├── OrderFlowApplication.java          # 메인 클래스
+├── OrderFlowApplication.java
 ├── config/
-│   └── RabbitMQConfig.java            # Exchange, Queue, Binding, Converter 설정
+│   └── RabbitMQConfig.java             # Exchange, Queue, Binding, Converter
 ├── domain/
 │   ├── product/
-│   │   └── Product.java               # 상품 엔티티 (재고 차감 로직 포함)
+│   │   └── Product.java                # 상품 엔티티
 │   └── order/
-│       ├── Order.java                  # 주문 엔티티 (상태 관리)
-│       ├── OrderItem.java             # 주문 상품 엔티티
-│       └── OrderStatus.java           # PENDING / CONFIRMED / FAILED
+│       ├── Order.java                  # 주문 엔티티
+│       ├── OrderItem.java              # 주문 상품 엔티티
+│       └── OrderStatus.java            # PENDING / CONFIRMED / FAILED
 ├── repository/
 │   ├── ProductRepository.java
 │   └── OrderRepository.java
 ├── dto/
 │   ├── product/
-│   │   ├── ProductCreateRequest.java   # 상품 등록 요청
-│   │   └── ProductResponse.java        # 상품 응답
+│   │   ├── ProductCreateRequest.java
+│   │   └── ProductResponse.java
 │   └── order/
-│       ├── OrderCreateRequest.java     # 주문 생성 요청
-│       └── OrderResponse.java          # 주문 응답
+│       ├── OrderCreateRequest.java
+│       └── OrderResponse.java
 ├── service/
-│   ├── ProductService.java            # 상품 CRUD
-│   └── OrderService.java             # 주문 생성 + 이벤트 발행
+│   ├── ProductService.java             # 상품 CRUD
+│   └── OrderService.java              # 주문 생성 + 이벤트 발행
 ├── event/
-│   ├── OrderCreatedEvent.java         # 메시지 DTO (record)
-│   └── OrderEventPublisher.java       # RabbitTemplate으로 메시지 발행
+│   ├── OrderCreatedEvent.java          # 메시지 DTO (record)
+│   └── OrderEventPublisher.java        # RabbitTemplate으로 메시지 발행
 ├── consumer/
-│   ├── StockConsumer.java             # stock.queue 구독 → 재고 차감
-│   ├── NotificationConsumer.java      # notification.queue 구독 → 알림 로그
-│   └── DeadLetterConsumer.java        # order.dlq 구독 → 실패 보상 처리
+│   ├── StockConsumer.java              # stock.queue → 재고 차감
+│   ├── NotificationConsumer.java       # notification.queue → 알림 로그
+│   └── DeadLetterConsumer.java         # order.dlq → 실패 보상 처리
 └── advice/
-    └── GlobalExceptionHandler.java    # 예외 처리
+    └── GlobalExceptionHandler.java
 ```
 
 ---
@@ -348,26 +301,20 @@ src/main/java/toy/orderflow/
 CREATE DATABASE orderflow;
 ```
 
-`src/main/resources/application.yml`에서 MySQL 접속 정보를 확인하세요:
+`application.yml.example`을 복사하여 `application.yml`을 만들고 DB 접속 정보를 설정하세요:
 
-```yaml
-spring:
-  datasource:
-    url: jdbc:mysql://localhost:3306/orderflow
-    username: root
-    password:          # ← 본인 비밀번호로 변경
+```bash
+cp src/main/resources/application.yml.example src/main/resources/application.yml
 ```
 
 #### RabbitMQ
 
-RabbitMQ 설치 후 기본 포트(5672)로 실행:
-
 ```bash
+# Docker (권장)
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
+
 # Windows (Chocolatey)
 choco install rabbitmq
-
-# Docker
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
 ```
 
 관리 콘솔: http://localhost:15672 (guest / guest)
@@ -388,7 +335,7 @@ curl -X POST http://localhost:8080/api/products \
   -H "Content-Type: application/json" \
   -d '{"name":"맥북 프로","price":2500000,"stockQuantity":10}'
 
-# 2) 주문 생성 (2개 주문 → 재고 충분)
+# 2) 주문 생성 (2개 → 재고 충분)
 curl -X POST http://localhost:8080/api/orders \
   -H "Content-Type: application/json" \
   -d '{"ordererName":"홍길동","items":[{"productId":1,"quantity":2}]}'
@@ -416,7 +363,7 @@ curl -X POST http://localhost:8080/api/products \
   -H "Content-Type: application/json" \
   -d '{"name":"아이패드","price":1000000,"stockQuantity":3}'
 
-# 2) 주문 생성 (100개 주문 → 재고 부족!)
+# 2) 주문 생성 (100개 → 재고 부족!)
 curl -X POST http://localhost:8080/api/orders \
   -H "Content-Type: application/json" \
   -d '{"ordererName":"김철수","items":[{"productId":2,"quantity":100}]}'
